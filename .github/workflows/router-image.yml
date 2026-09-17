@@ -1,0 +1,85 @@
+# Publish the patched sglang-router to this fork's GitHub Container Registry.
+#
+# Why this exists: the lab needs a router that exports smg_cache_aware_* (the
+# stock image exports nothing about the cache_aware policy's radix tree). That
+# used to be built by hand on each GPU box over DOCKER_HOST=ssh://, which meant
+# a fifteen-minute Rust build on the machine under measurement. Now the image is
+# built here and every box just pulls it.
+#
+# The package is free: GHCR does not bill storage or bandwidth for public
+# packages. After the first successful run, set the package to Public once at
+#   https://github.com/users/<owner>/packages/container/sglang-router/settings
+# otherwise the GPU boxes need a pull secret.
+name: router-image
+
+on:
+  push:
+    branches:
+      - 'lab/**'
+    tags:
+      - 'router-v*'
+    paths:
+      - 'sgl-model-gateway/**'
+      - '.github/router.Dockerfile'
+      - '.github/workflows/router-image.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: router-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags, in the order they matter to the lab:
+      #   sha-<short>   the only one a result should ever record, because it is
+      #                 the one that cannot be moved after the fact
+      #   <branch>      convenience for "the current patched router"
+      #   router-vX.Y   when a tag is pushed
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/sglang-router
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=ref,event=branch
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.title=sglang-router (cache-aware metrics)
+            org.opencontainers.image.description=sglang-router with smg_cache_aware_* policy metrics
+
+      - uses: docker/build-push-action@v6
+        with:
+          # The crate is self-contained; the context is 6 MB, not the repo.
+          context: ./sgl-model-gateway
+          file: ./.github/router.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Without this the Rust dependency tree recompiles from scratch on
+          # every run, which is ~15 minutes of runner time per push.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: how to use it
+        run: |
+          echo "Point the lab at this image:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "ROUTER_IMAGE=ghcr.io/${{ github.repository_owner }}/sglang-router:sha-$(git rev-parse --short HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
