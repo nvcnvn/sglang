@@ -26,13 +26,28 @@ ARG PYTHON_VERSION=3.11
 # ---------------------------------------------------------------------------
 FROM rust:1.90-bookworm AS wheel
 
-# patchelf is not optional: maturin links libssl/libcrypto dynamically and
-# rewrites the RPATH to bundle them into the wheel. Without it the build fails
-# at the very last step, after the whole dependency tree has compiled.
+# Two packages that look redundant and are not:
+#
+#   libprotobuf-dev  ships the well-known types (google/protobuf/timestamp.proto,
+#                    struct.proto) under /usr/include. protobuf-compiler is only
+#                    the protoc binary, and smg-grpc-client's proto imports those
+#                    files -- without this the build dies in that crate's build
+#                    script with "google/protobuf/timestamp.proto: File not found".
+#
+#   patchelf         maturin links libssl/libcrypto dynamically and rewrites the
+#                    RPATH to bundle them into the wheel. Without it the build
+#                    fails at the very last step, after the whole dependency tree
+#                    has compiled.
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
-        protobuf-compiler libssl-dev pkg-config cmake patchelf \
+        protobuf-compiler libprotobuf-dev libssl-dev pkg-config cmake patchelf \
         python3-pip python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+# sgl-model-gateway/rust-toolchain.toml pins channel 1.90 with the clippy
+# component, which this image does not ship -- so cargo would re-sync the whole
+# toolchain on every build, inside the build step, uncached. Doing it here makes
+# it a layer instead.
+RUN rustup toolchain install 1.90 --profile minimal --component clippy
 
 RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir --upgrade pip maturin
 
