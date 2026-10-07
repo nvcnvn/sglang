@@ -113,7 +113,9 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     return (
         not memory_config.enable_hisparse
         and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
+        # DSAIndexerPoolHost keeps host layers only for the device layers that
+        # hold index keys; the NPU compact indexer layout has no such host pool.
+        and not (memory_config.enable_hierarchical_cache and _is_npu)
         and not memory_config.enable_unified_cache_external_linker
         and get_disagg().disaggregation_mode == "null"
     )
