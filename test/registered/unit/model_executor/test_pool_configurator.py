@@ -899,11 +899,11 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
-    def test_resolved_hicache_override_prices_every_indexer_layer(
+    def test_resolved_hicache_override_prices_only_topk_indexer_layers(
         self,
         _mock_calculate_mla_kv_cache_dim,
     ):
-        """Post-publish HiCache overrides must keep sizing and allocation aligned."""
+        """HiCache host pools are compact, so shared layers carry no index-K."""
         num_layers = 6
         mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
         _configure_dsa_model(mr)
@@ -920,7 +920,23 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
 
             cfg = DefaultPoolConfigurator(mr)
 
-        self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+        # index_topk_freq=4, index_skip_topk_offset=3: layers 0-2 compute top-k.
+        self.assertEqual(cfg._cell_size, 576 * num_layers + 132 * 3)
+
+    def test_hicache_keeps_dense_index_k_on_npu(self):
+        from sglang.srt.mem_cache import kv_cache_configurator
+
+        _make_model_runner(self, num_layers=6, use_mla_backend=True)
+        with get_memory().override(enable_hierarchical_cache=True):
+            self.assertTrue(
+                kv_cache_configurator._should_elide_dsa_index_k(is_draft_worker=False)
+            )
+            with patch.object(kv_cache_configurator, "_is_npu", True):
+                self.assertFalse(
+                    kv_cache_configurator._should_elide_dsa_index_k(
+                        is_draft_worker=False
+                    )
+                )
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
