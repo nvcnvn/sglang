@@ -824,7 +824,7 @@ class TestNixlDirectIO(CustomTestCase):
         finally:
             os.close(fd)
 
-    def _make_direct_io_hicache(self) -> HiCacheNixl:
+    def _make_direct_io_hicache(self, **extra_config) -> HiCacheNixl:
         """Return a HiCacheNixl configured for O_DIRECT (default) with the POSIX backend."""
         storage_config = HiCacheStorageConfig(
             tp_rank=0,
@@ -837,7 +837,7 @@ class TestNixlDirectIO(CustomTestCase):
             is_page_first_layout=False,
             model_name="test_model",
             enable_storage_metrics=False,
-            extra_config={"plugin": {"posix": {"active": True}}},
+            extra_config={"plugin": {"posix": {"active": True}}, **extra_config},
             # use_direct_io defaults to True (env var)
         )
         try:
@@ -889,6 +889,138 @@ class TestNixlDirectIO(CustomTestCase):
             self.skipTest("NIXL not available")
         self.assertFalse(hicache.needs_page_alignment)
         self.assertFalse(hicache.file_manager.use_direct_io)
+
+    def _require_o_direct(self):
+        """Skip unless test_dir's filesystem takes an aligned O_DIRECT write (tmpfs does not)."""
+        import mmap
+
+        path = os.path.join(self.test_dir, "o_direct_probe")
+        buf = mmap.mmap(-1, 4096)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
+            try:
+                os.write(fd, buf)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            self.skipTest(f"no O_DIRECT in {self.test_dir}: {e}")
+        finally:
+            buf.close()
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def _stored_file_sizes(self):
+        return sorted(
+            {
+                os.path.getsize(os.path.join(root, name))
+                for root, _, names in os.walk(self.test_dir)
+                for name in names
+            }
+        )
+
+    def test_storage_page_align_only_for_nixl_o_direct_page_first_direct(self):
+        from sglang.srt.mem_cache.pool_host.mla import storage_page_align
+
+        with mock.patch.dict(os.environ, {"SGLANG_HICACHE_NIXL_USE_DIRECT_IO": "1"}):
+            self.assertEqual(storage_page_align("page_first_direct", "nixl"), 4096)
+            self.assertEqual(storage_page_align("page_first", "nixl"), 1)
+            self.assertEqual(storage_page_align("layer_first", "nixl"), 1)
+            self.assertEqual(storage_page_align("page_first_direct", "default"), 1)
+            self.assertEqual(storage_page_align("page_first_direct", "mooncake"), 1)
+        with mock.patch.dict(os.environ, {"SGLANG_HICACHE_NIXL_USE_DIRECT_IO": "0"}):
+            self.assertEqual(storage_page_align("page_first_direct", "nixl"), 1)
+
+    def _padded_indexer_pool(self, align):
+        from sglang.srt.mem_cache.pool_host.dsa import (
+            DSAIndexerPoolHost,
+            make_dsa_indexer_pool_decl,
+        )
+
+        pool = SimpleNamespace(
+            layer_num=1,
+            device="cpu",
+            layer_shard_enabled=False,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            end_layer=1,
+            index_head_dim=128,
+            quant_block_size=128,
+            page_size=64,
+            index_page_size=64,
+            skip_topk_layers=[False],
+            index_k_with_scale_buffer=[torch.empty((5, 64 * 132), dtype=torch.uint8)],
+        )
+        anchor = SimpleNamespace(
+            page_size=64,
+            layout="page_first_direct",
+            size=256,
+            page_num=5,
+            storage_page_align=align,
+        )
+        host = DSAIndexerPoolHost(
+            make_dsa_indexer_pool_decl(pool), anchor, pin_memory=False
+        )
+        self.addCleanup(host.destroy)
+        return host
+
+    def test_padded_indexer_pool_layout(self):
+        """Pages sit 4 KiB-aligned with zeros after them; pages and meta ignore the padding."""
+        host = self._padded_indexer_pool(4096)
+        self.assertEqual(host.page_stride_bytes, 12288)
+        self.assertTrue(host.is_stride_page_aligned(4096))
+        base = host.index_k_with_scale_buffer.data_ptr()
+        ptrs, sizes = host.get_page_buffer_meta(torch.arange(64, 256))
+        self.assertEqual(ptrs, [base + p * 12288 for p in (1, 2, 3)])
+        self.assertEqual(sizes, [12288] * 3)
+
+        page = torch.full((8448,), 7, dtype=torch.uint8)
+        host.set_from_flat_data_page(128, page)
+        self.assertTrue(torch.equal(host.get_data_page(128), page))
+        raw = host.index_k_with_scale_buffer.as_strided(
+            (host.indexer_page_num, 12288), (12288, 1)
+        )
+        self.assertTrue(torch.equal(raw[2, :8448], page))
+        self.assertEqual(int(raw[2, 8448:].count_nonzero()), 0)
+
+        unpadded = self._padded_indexer_pool(1)
+        self.assertEqual(unpadded.page_stride_bytes, 8448)
+        self.assertFalse(unpadded.is_stride_page_aligned(4096))
+
+    def test_odirect_padded_indexer_pool_zero_copy_round_trip(self):
+        """A padded pool keeps zero-copy under O_DIRECT and every page survives."""
+        self._require_o_direct()
+        host = self._padded_indexer_pool(4096)
+        # The L3 cleaner would delete the files at once on a /tmp past its watermark.
+        hicache = self._make_direct_io_hicache(l3_cleaner_enabled=False)
+        self.addCleanup(hicache.close)
+        hicache.register_mem_host_pool_v2(host, PoolName.INDEXER)
+        self.assertTrue(hicache._hybrid_pool_ctx[PoolName.INDEXER].is_zero_copy)
+
+        pages = [1, 2, 3]
+        generator = torch.Generator().manual_seed(0)
+        expected = {
+            p: torch.randint(0, 256, (8448,), dtype=torch.uint8, generator=generator)
+            for p in pages
+        }
+        for p in pages:
+            host.set_from_flat_data_page(p * 64, expected[p])
+        transfer = PoolTransfer(
+            name=PoolName.INDEXER,
+            keys=[f"odirect_padded_{p}" for p in pages],
+            host_indices=torch.arange(64, 256),
+        )
+        self.assertEqual(
+            hicache.batch_set_v2([transfer]), {PoolName.INDEXER: [True] * 3}
+        )
+        self.assertEqual(self._stored_file_sizes(), [12288])
+
+        for p in pages:
+            host.set_from_flat_data_page(p * 64, torch.zeros_like(expected[p]))
+        self.assertEqual(
+            hicache.batch_get_v2([transfer]), {PoolName.INDEXER: [True] * 3}
+        )
+        for p in pages:
+            self.assertTrue(torch.equal(host.get_data_page(p * 64), expected[p]))
 
 
 class TestNixlFileLayout(CustomTestCase):
