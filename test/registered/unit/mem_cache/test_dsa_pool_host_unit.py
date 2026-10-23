@@ -1,5 +1,7 @@
 import inspect
+import os
 import unittest
+from unittest import mock
 
 import torch
 
@@ -167,6 +169,107 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
     )
     def test_device_to_host_indexer_direct(self):
         self._run_device_to_host_indexer_copy(io_backend="direct")
+
+    @unittest.skipIf(is_hip(), "page_size=64 trips the ROCm HIP-preshuffle assert")
+    def test_nixl_odirect_padded_pages_direct_round_trip(self):
+        """The page_first_direct kernels follow the padded host page stride."""
+        page_size = 64
+        layer_num = 2
+        device_pool = DSATokenToKVPool(
+            size=page_size * 8,
+            page_size=page_size,
+            kv_lora_rank=128,
+            dtype=torch.bfloat16,
+            qk_rope_head_dim=8,
+            layer_num=layer_num,
+            device="cuda",
+            enable_memory_saver=False,
+            # 2 layers x 64 tokens x (128 + 8) x bf16 = 34,816 B: not whole 4 KiB blocks
+            kv_cache_dim=136,
+            index_head_dim=128,
+        )
+        with mock.patch.dict(os.environ, {"SGLANG_HICACHE_NIXL_USE_DIRECT_IO": "1"}):
+            mla_host = MLATokenToKVPoolHost(
+                device_pool=device_pool,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=page_size,
+                layout="page_first_direct",
+                pin_memory=True,
+                device="cpu",
+                allocator_type="nixl",
+                override_kv_cache_dim=device_pool.kv_cache_dim,
+            )
+            indexer_host = DSAIndexerPoolHost(
+                decl=make_dsa_indexer_pool_decl(device_pool),
+                anchor_host=mla_host,
+                pin_memory=True,
+                device="cpu",
+                allocator_type="nixl",
+            )
+        self.addCleanup(indexer_host.destroy)
+        self.addCleanup(mla_host.destroy)
+        self.assertEqual(mla_host.page_stride_bytes, 36864)
+        self.assertEqual(indexer_host.page_stride_bytes, 20480)
+        self.assertTrue(mla_host.is_stride_page_aligned(4096))
+        self.assertTrue(indexer_host.is_stride_page_aligned(4096))
+
+        for layer_id in range(layer_num):
+            for buf in (
+                device_pool.kv_buffer[layer_id],
+                device_pool.index_k_with_scale_buffer[layer_id],
+            ):
+                raw = buf.view(torch.uint8)
+                raw.copy_(torch.randint(0, 256, raw.shape, device="cuda", dtype=torch.uint8))
+        expected_kv = [b.view(torch.uint8).clone() for b in device_pool.kv_buffer]
+        expected_index = [b.clone() for b in device_pool.index_k_with_scale_buffer]
+
+        src_pages = torch.tensor([1, 2, 3])
+        host_pages = torch.tensor([0, 2, 4])
+        dst_pages = torch.tensor([4, 5, 6])
+        src = self._token_indices_for_pages(src_pages, page_size, device="cuda")
+        host = self._token_indices_for_pages(host_pages, page_size, device="cpu")
+        dst = self._token_indices_for_pages(dst_pages, page_size, device="cuda")
+        # cudaMemcpyBatchAsync, which these kernels use, refuses the legacy
+        # default stream; the HiCache controller runs them on its own streams.
+        with torch.cuda.stream(torch.cuda.Stream()):
+            mla_host.backup_from_device_all_layer(device_pool, host, src, "direct")
+            indexer_host.backup_from_device_all_layer(
+                device_pool, host, src, "direct"
+            )
+            for layer_id in range(layer_num):
+                mla_host.load_to_device_per_layer(
+                    device_pool, host, dst, layer_id, "direct"
+                )
+                indexer_host.load_to_device_per_layer(
+                    device_pool, host, dst, layer_id, "direct"
+                )
+        torch.cuda.synchronize()
+
+        for layer_id in range(layer_num):
+            for s_page, d_page in zip(src_pages.tolist(), dst_pages.tolist()):
+                got = device_pool.kv_buffer[layer_id].view(torch.uint8)[
+                    d_page * page_size : (d_page + 1) * page_size
+                ]
+                want = expected_kv[layer_id][
+                    s_page * page_size : (s_page + 1) * page_size
+                ]
+                self.assertTrue(torch.equal(got, want))
+                self.assertTrue(
+                    torch.equal(
+                        device_pool.index_k_with_scale_buffer[layer_id][d_page],
+                        expected_index[layer_id][s_page],
+                    )
+                )
+        for buf, stride in (
+            (mla_host.kv_buffer, mla_host.page_stride_bytes),
+            (indexer_host.index_k_with_scale_buffer, indexer_host.page_stride_bytes),
+        ):
+            page_bytes = buf[0].numel() * buf.element_size()
+            padded = torch.as_strided(
+                buf.view(torch.uint8), (buf.shape[0], stride), (stride, 1)
+            )
+            self.assertEqual(int(padded[:, page_bytes:].count_nonzero()), 0)
 
 
 if __name__ == "__main__":
