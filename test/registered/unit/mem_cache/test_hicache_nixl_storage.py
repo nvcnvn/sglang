@@ -824,7 +824,7 @@ class TestNixlDirectIO(CustomTestCase):
         finally:
             os.close(fd)
 
-    def _make_direct_io_hicache(self) -> HiCacheNixl:
+    def _make_direct_io_hicache(self, **extra_config) -> HiCacheNixl:
         """Return a HiCacheNixl configured for O_DIRECT (default) with the POSIX backend."""
         storage_config = HiCacheStorageConfig(
             tp_rank=0,
@@ -837,7 +837,7 @@ class TestNixlDirectIO(CustomTestCase):
             is_page_first_layout=False,
             model_name="test_model",
             enable_storage_metrics=False,
-            extra_config={"plugin": {"posix": {"active": True}}},
+            extra_config={"plugin": {"posix": {"active": True}}, **extra_config},
             # use_direct_io defaults to True (env var)
         )
         try:
@@ -889,6 +889,121 @@ class TestNixlDirectIO(CustomTestCase):
             self.skipTest("NIXL not available")
         self.assertFalse(hicache.needs_page_alignment)
         self.assertFalse(hicache.file_manager.use_direct_io)
+
+    def _require_o_direct(self):
+        """Skip unless test_dir's filesystem takes an aligned O_DIRECT write (tmpfs does not)."""
+        import mmap
+
+        path = os.path.join(self.test_dir, "o_direct_probe")
+        buf = mmap.mmap(-1, 4096)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
+            try:
+                os.write(fd, buf)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            self.skipTest(f"no O_DIRECT in {self.test_dir}: {e}")
+        finally:
+            buf.close()
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def _stored_file_sizes(self):
+        return sorted(
+            {
+                os.path.getsize(os.path.join(root, name))
+                for root, _, names in os.walk(self.test_dir)
+                for name in names
+            }
+        )
+
+    def test_odirect_copy_mode_round_trip_unaligned_pages(self):
+        """Pages that are not whole O_DIRECT blocks survive the bounce slots."""
+        self._require_o_direct()
+        # The L3 cleaner would delete the files at once on a /tmp past its watermark.
+        hicache = self._make_direct_io_hicache(l3_cleaner_enabled=False)
+        self.addCleanup(hicache.close)
+        # K and V x 2 layers x 2 tokens x 2 heads x 375 x fp32 = 24,000 B per page:
+        # whole blocks of neither 512 nor 4096 bytes, so slots 1.. start unaligned too.
+        host = MockMemPoolHost(is_zero_copy_mode=False, head_dim=375)
+        hicache.register_mem_pool_host(host)
+        self.assertFalse(hicache.is_zero_copy)
+
+        host.kv_buffer.copy_(torch.randn_like(host.kv_buffer))
+        expected = host.kv_buffer.clone()
+        keys = [f"odirect_v1_{i}" for i in range(host.num_pages)]
+        indices = torch.arange(host.size)
+        self.assertEqual(hicache.batch_set_v1(keys, indices), [True] * len(keys))
+        self.assertEqual(self._stored_file_sizes(), [24576])
+
+        host.kv_buffer.zero_()
+        self.assertEqual(hicache.batch_get_v1(keys, indices), [True] * len(keys))
+        self.assertTrue(torch.equal(host.kv_buffer, expected))
+
+    def test_odirect_dsa_indexer_copy_mode_round_trip(self):
+        """DSA index pages (8,448 B for one layer) survive the hybrid bounce slots."""
+        self._require_o_direct()
+        from sglang.srt.mem_cache.pool_host.dsa import (
+            DSAIndexerPoolHost,
+            make_dsa_indexer_pool_decl,
+        )
+
+        pool = SimpleNamespace(
+            layer_num=1,
+            device="cpu",
+            layer_shard_enabled=False,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            end_layer=1,
+            index_head_dim=128,
+            quant_block_size=128,
+            page_size=64,
+            index_page_size=64,
+            skip_topk_layers=[False],
+            index_k_with_scale_buffer=[torch.empty((5, 64 * 132), dtype=torch.uint8)],
+        )
+        anchor = SimpleNamespace(
+            page_size=64, layout="page_first", size=256, page_num=5
+        )
+        host = DSAIndexerPoolHost(
+            make_dsa_indexer_pool_decl(pool), anchor, pin_memory=False
+        )
+        self.addCleanup(host.destroy)
+        # The L3 cleaner would delete the files at once on a /tmp past its watermark.
+        hicache = self._make_direct_io_hicache(l3_cleaner_enabled=False)
+        self.addCleanup(hicache.close)
+        hicache.register_mem_host_pool_v2(host, PoolName.INDEXER)
+        self.assertFalse(hicache._hybrid_pool_ctx[PoolName.INDEXER].is_zero_copy)
+
+        pages = [1, 2, 3]
+        page_numel = host.get_dummy_flat_data_page().numel()
+        generator = torch.Generator().manual_seed(0)
+        expected = {
+            p: torch.randint(
+                0, 256, (page_numel,), dtype=torch.uint8, generator=generator
+            )
+            for p in pages
+        }
+        for p in pages:
+            host.set_from_flat_data_page(p * 64, expected[p])
+        transfer = PoolTransfer(
+            name=PoolName.INDEXER,
+            keys=[f"odirect_dsa_{p}" for p in pages],
+            host_indices=torch.arange(64, 256),
+        )
+        self.assertEqual(
+            hicache.batch_set_v2([transfer]), {PoolName.INDEXER: [True] * 3}
+        )
+        self.assertEqual(self._stored_file_sizes(), [12288])
+
+        for p in pages:
+            host.set_from_flat_data_page(p * 64, torch.zeros_like(expected[p]))
+        self.assertEqual(
+            hicache.batch_get_v2([transfer]), {PoolName.INDEXER: [True] * 3}
+        )
+        for p in pages:
+            self.assertTrue(torch.equal(host.get_data_page(p * 64), expected[p]))
 
 
 class TestNixlFileLayout(CustomTestCase):
