@@ -64,6 +64,7 @@ class _HybridPoolContext:
     bounce_set: Optional[torch.Tensor] = None
     bounce_get: Optional[torch.Tensor] = None
     bounce_page_bytes: int = 0
+    bounce_page_numel: int = 0
 
 
 class HiCacheNixl(HiCacheStorage):
@@ -157,6 +158,7 @@ class HiCacheNixl(HiCacheStorage):
         self._bounce_set: Optional[torch.Tensor] = None
         self._bounce_get: Optional[torch.Tensor] = None
         self._bounce_page_bytes: Optional[int] = None
+        self._bounce_page_numel: Optional[int] = None
         self._logical_anchor = False
         self._hybrid_pool_ctx: dict[PoolName, _HybridPoolContext] = {}
         self.registered_pools: dict[PoolName, HostKVCache] = {}
@@ -357,6 +359,7 @@ class HiCacheNixl(HiCacheStorage):
             marker_numel = 4096 if self.needs_page_alignment else 1
             pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
             self._bounce_page_bytes = marker_numel
+            self._bounce_page_numel = marker_numel
             self._bounce_set = self._alloc_registered(
                 marker_numel, torch.uint8, pin_memory, "logical_anchor_set"
             )
@@ -397,14 +400,16 @@ class HiCacheNixl(HiCacheStorage):
             sample = mem_pool_host.get_dummy_flat_data_page()
             page_numel = sample.numel()
             page_dtype = sample.dtype
-            self._bounce_page_bytes = page_numel * sample.element_size()
+            slot_numel = self._bounce_slot_numel(page_numel, sample.element_size())
+            self._bounce_page_numel = page_numel
+            self._bounce_page_bytes = slot_numel * sample.element_size()
             del sample
             pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
             self._bounce_set = self._alloc_registered(
-                page_numel, page_dtype, pin_memory, "bounce_set"
+                slot_numel, page_dtype, pin_memory, "bounce_set"
             )
             self._bounce_get = self._alloc_registered(
-                page_numel, page_dtype, pin_memory, "bounce_get"
+                slot_numel, page_dtype, pin_memory, "bounce_get"
             )
 
         logger.info(
@@ -433,22 +438,24 @@ class HiCacheNixl(HiCacheStorage):
             page_numel = sample.numel()
             # Serialized index and Mamba pages can differ from the pool dtype.
             page_dtype = sample.dtype
-            page_bytes = page_numel * sample.element_size()
+            slot_numel = self._bounce_slot_numel(page_numel, sample.element_size())
+            slot_bytes = slot_numel * sample.element_size()
             del sample
 
             pin_memory = bool(getattr(host_pool, "pin_memory", False))
             bounce_set = self._alloc_registered(
-                page_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_set"
+                slot_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_set"
             )
             bounce_get = self._alloc_registered(
-                page_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_get"
+                slot_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_get"
             )
             self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
                 host_pool=host_pool,
                 is_zero_copy=False,
                 bounce_set=bounce_set,
                 bounce_get=bounce_get,
-                bounce_page_bytes=page_bytes,
+                bounce_page_bytes=slot_bytes,
+                bounce_page_numel=page_numel,
             )
 
         logger.info(
@@ -476,6 +483,17 @@ class HiCacheNixl(HiCacheStorage):
             )
             return False
         return True
+
+    def _bounce_slot_numel(self, page_numel: int, element_size: int) -> int:
+        """Elements per bounce slot: one page, and under O_DIRECT zeros after it
+        up to a whole number of 4 KiB blocks. O_DIRECT refuses (EINVAL) a length
+        or a slot start that is not on a block, and NIXL's POSIX plugin still
+        reports such a transfer done, leaving empty files that read back as zeros.
+        """
+        if not self.needs_page_alignment:
+            return page_numel
+        block_numel = 4096 // element_size
+        return -(-page_numel // block_numel) * block_numel
 
     def _get_bounce_slot_buffers(
         self, buf: torch.Tensor, page_bytes: int, page_num: int
@@ -579,7 +597,7 @@ class HiCacheNixl(HiCacheStorage):
         if for_write:
             for i, page_offset in enumerate(page_offsets):
                 src = host_pool.get_data_page(page_offset, flat=True)
-                bounce[i].copy_(src)
+                bounce[i, : ctx.bounce_page_numel].copy_(src)
 
         host_buffers = self._get_bounce_slot_buffers(
             bounce, ctx.bounce_page_bytes, len(page_offsets)
@@ -631,6 +649,7 @@ class HiCacheNixl(HiCacheStorage):
         self._bounce_set = None
         self._bounce_get = None
         self._bounce_page_bytes = None
+        self._bounce_page_numel = None
         self._hybrid_pool_ctx.clear()
 
     def __del__(self):
@@ -744,7 +763,7 @@ class HiCacheNixl(HiCacheStorage):
                     src = self.mem_pool_host.get_data_page(
                         host_indices[i * page_size], flat=True
                     )
-                    bounce[i].copy_(src)
+                    bounce[i, : self._bounce_page_numel].copy_(src)
 
         host_buffers = self._bounce_slot_buffers(bounce, page_num)
         key_list = [self._get_suffixed_key(key) for key in keys]
@@ -802,7 +821,8 @@ class HiCacheNixl(HiCacheStorage):
             if not results[i]:
                 break
             self.mem_pool_host.set_from_flat_data_page(
-                host_indices[i * page_size], self._bounce_get[i]
+                host_indices[i * page_size],
+                self._bounce_get[i, : self._bounce_page_numel],
             )
         return results
 
@@ -980,7 +1000,9 @@ class HiCacheNixl(HiCacheStorage):
             page_results = self._page_results(transfer_results, key_multiplier)
             if not ctx.is_zero_copy:
                 for ok, page_offset, data_page in zip(
-                    page_results, page_offsets, ctx.bounce_get
+                    page_results,
+                    page_offsets,
+                    ctx.bounce_get[:, : ctx.bounce_page_numel],
                 ):
                     if not ok:
                         break
