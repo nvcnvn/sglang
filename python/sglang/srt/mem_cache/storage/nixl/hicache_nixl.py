@@ -383,9 +383,7 @@ class HiCacheNixl(HiCacheStorage):
                 self.is_zero_copy = False
 
         if self.is_zero_copy:
-            self._pre_register_host(
-                kv.data_ptr(), kv.numel() * kv.element_size(), "kv_buffer"
-            )
+            self._pre_register_host(kv.data_ptr(), self._span_bytes(kv), "kv_buffer")
         else:
             # One bounce buffer per direction so set/get run lock-free across
             # the prefetch and backup threads. Sized from get_dummy_flat_data_page()
@@ -417,7 +415,7 @@ class HiCacheNixl(HiCacheStorage):
             for i, buf in enumerate(host_pool.get_hybrid_pool_buffer()):
                 self._pre_register_host(
                     buf.data_ptr(),
-                    buf.numel() * buf.element_size(),
+                    self._span_bytes(buf),
                     f"{host_pool_name}_buffer_{i}",
                 )
             self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
@@ -595,6 +593,12 @@ class HiCacheNixl(HiCacheStorage):
         buf = alloc_mmap((STORAGE_BATCH_SIZE, page_numel), dtype)
         self._pre_register_host(buf.data_ptr(), buf.numel() * buf.element_size(), kind)
         return buf
+
+    @staticmethod
+    def _span_bytes(buf: torch.Tensor) -> int:
+        """Bytes from the first page to the end of the last, padding between
+        pages included (a host pool may pad each page for O_DIRECT)."""
+        return buf.shape[0] * buf.stride(0) * buf.element_size()
 
     def _pre_register_host(self, base_addr: int, total_size: int, kind: str) -> None:
         """Register a single DRAM region up-front and remember the handle."""

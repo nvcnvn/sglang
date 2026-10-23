@@ -18,12 +18,16 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
 )
-from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+from sglang.srt.mem_cache.pool_host.common import (
+    _CUDA_HOST_REGISTERED_RANGES_ATTR,
+    ALLOC_MEMORY_FUNCS,
+)
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -46,6 +50,44 @@ if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
 logger = logging.getLogger(__name__)
+
+
+def storage_page_align(layout: str, allocator_type: str) -> int:
+    """Bytes each host page's stride is padded to, with zeros, so NIXL's file L3
+    can move pages in place with O_DIRECT (zero-copy): O_DIRECT needs every page
+    to start on a 4 KiB block and to be whole blocks long. 1 means no padding.
+    """
+    if (
+        layout == "page_first_direct"
+        and allocator_type == "nixl"
+        and envs.SGLANG_HICACHE_NIXL_USE_DIRECT_IO.get()
+    ):
+        return 4096
+    return 1
+
+
+def alloc_padded_pages(
+    alloc_func, page_dims: tuple, page_num: int, page_stride_bytes: int, dtype, **kw
+) -> torch.Tensor:
+    """A (page_num, *page_dims) view whose pages lie page_stride_bytes apart in
+    one allocation; the bytes between pages stay zero."""
+    page_numel = 1
+    for d in page_dims:
+        page_numel *= d
+    raw = alloc_func(
+        (page_num, page_stride_bytes // dtype.itemsize),
+        dtype=dtype,
+        registration_granularity_bytes=page_stride_bytes,
+        **kw,
+    )
+    pages = raw[:, :page_numel].unflatten(1, page_dims)
+    if hasattr(raw, _CUDA_HOST_REGISTERED_RANGES_ATTR):
+        setattr(
+            pages,
+            _CUDA_HOST_REGISTERED_RANGES_ATTR,
+            getattr(raw, _CUDA_HOST_REGISTERED_RANGES_ATTR),
+        )
+    return pages
 
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
@@ -71,6 +113,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
+        self.storage_page_align = storage_page_align(layout, allocator_type)
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -198,8 +241,29 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
+        page_bytes = self.page_size * self.layout_dim
+        align = self.storage_page_align
+        self.page_stride_bytes = -(-page_bytes // align) * align
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        if self.page_stride_bytes != page_bytes:
+            logger.info(
+                "HiCache %s host pool: pages padded from %d to %d bytes for "
+                "NIXL O_DIRECT.",
+                self.pool_label,
+                page_bytes,
+                self.page_stride_bytes,
+            )
+            return alloc_padded_pages(
+                alloc_func,
+                dims[1:],
+                self.page_num,
+                self.page_stride_bytes,
+                self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
         buffer = alloc_func(
             dims,
             dtype=self.dtype,
@@ -604,7 +668,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     ptr_list.append(k_ptr)
             element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
             element_size_list = [element_size] * len(ptr_list)
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout == "page_first_direct":
+            ptr_list = [
+                kv_buffer_data_ptr
+                + indices[index] // self.page_size * self.page_stride_bytes
+                for index in range(0, len(indices), self.page_size)
+            ]
+            element_size_list = [self.page_stride_bytes] * len(ptr_list)
+        elif self.layout == "page_first":
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
                     kv_buffer_data_ptr
@@ -639,8 +710,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         """
         if self.layout not in ("page_first", "page_first_direct"):
             return False
-        stride = (
-            self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
-        )
+        stride = self.page_stride_bytes
         base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
         return base_aligned and stride % page_size_bytes == 0
